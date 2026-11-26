@@ -16,11 +16,28 @@
 
 <br>
 
+## ◆ neptune-fps
+
+This is Neptune VI with our frame-time work on top. Install and start it exactly as described under **How to start** below: the same `victory.exe` + `play-zm.ps1`, the same switches.
+
+What changes is what `play-zm.ps1` turns on by default:
+
+| | Default here | Back to Neptune's behaviour |
+|:--|:--|:--|
+| **Copy-back** | Lazy copy-back on demand with fault tracking of written pages, in place of Neptune's fetch queue and quiet-back | `-StockCopies` |
+| **In-place memory** | `auto`: only on a fast PCIe link, otherwise data stays on the card | `-InPlace off` / `-InPlace on` |
+| **Draw calls** | Translated by threads of ours (`VICTORY_THIN`) | `-NoThin` |
+| **Indirect clamps** | Sanitized after their writers, batched in windows | `-NoClampAfterWriter`, `-NoClampBatch` |
+
+Measured on a 4-core PC with an RTX A4500 (Series X, at the spawn point): frames 170-220 ms became about 90-125 ms; copies up 32-39 ms became 7-13 ms; the copy-back thread 20-32 ms became 8-15 ms. Newer experiments (batched indirect checks, card-side fills, keeping the card's clocks up, heap-sync diffing, writes beside guards) are in the code behind their own `VICTORY_*` switches and are **off** unless set.
+
+<br>
+
 ## ◆ Why this port
 
 Upstream froze the GPU right before the first gameplay scene on a Ryzen 7 9800X3D with an RTX 5070 Ti. The cause: the game's indirect draw arguments ran unchecked, and some of them hold garbage.
 
-This port checks every such record on the CPU first. Sane records run as fast as before, broken ones go through the safe path. **The game now gets into gameplay.**
+This port sanitizes those records once, right after the GPU work that writes them, and then lets the draws run directly. Broken records become empty draws instead of hanging the GPU. **The game gets into gameplay, at the same speed as the unchecked mode** (4.6 fps with per-draw checks, 8.4 fps with this, measured at one save).
 
 <br>
 
@@ -29,30 +46,87 @@ This port checks every such record on the CPU first. Sane records run as fast as
 | | |
 |:--|:--|
 | **Console instructions** | The Xbox CPU is a Zen 2. Instructions Intel lacks (`MONITORX`, `MWAITX`, `CLZERO`, `INSERTQ`) have to be emulated on Intel. A Ryzen has them in hardware. |
-| **Indirect draws** | `VICTORY_INDIRECT_RAW=3` is the default: argument records are checked on the CPU before the GPU runs them. `-RawIndirect` brings back upstream's mode. |
+| **Indirect draws** | `VICTORY_CLAMP_AFTER_WRITER=1` + `VICTORY_INDIRECT_RAW=3` are the default: argument records are sanitized once after the GPU writes them, then run raw. `-RawIndirect` brings back upstream's unchecked mode. |
+| **Black sky frames** | Fixed: a replaced texture keeps showing until its new version is uploaded. |
+| **Water physics** | On by default: the ocean's height maps are copied back into game memory, so boats float and you can swim. `-NoOcean` turns it off. |
 | **32 GB RAM** | Upstream was tuned on 64 GB. `-Ram32` shrinks the list pool, the texture staging and the card copies. |
 
 <br>
 
-## ◆ Quick start
+## ◆ How to start
 
 > [!IMPORTANT]
 > No game files are included. You need your own copy of the game.
 
-```powershell
-# first launch: translates the shaders (~7 min), then starts the game
-.\play-zm.ps1 -Game 'D:\GTA6\game_scarlett_master.exe' -SeriesX -Ram32 -Warm
+**1 · Get the files into one folder**
 
-# every launch after that
-.\play-zm.ps1 -Game 'D:\GTA6\game_scarlett_master.exe' -SeriesX -Ram32
+```
+D:\Neptune\
+├─ victory.exe      ← build it (see Build below), or take it from Releases if one is published
+└─ play-zm.ps1      ← from tools\ in this repo
 ```
 
-| Switch | |
+**2 · Open PowerShell in that folder**
+
+In Explorer, open the folder, type `powershell` into the address bar and press Enter.
+If scripts are blocked, run this once for the window:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+```
+
+**3 · First start: translate the shaders**
+
+```powershell
+.\play-zm.ps1 -Game 'D:\GTA6\game_scarlett_master.exe' -SeriesX -Warm
+```
+
+`-Warm` translates every shader of the game into the cache first (about 7 minutes, progress shows in PowerShell), then starts the game. You only need it once, and again after updating Neptune.
+
+**4 · Every start after that**
+
+```powershell
+.\play-zm.ps1 -Game 'D:\GTA6\game_scarlett_master.exe' -SeriesX
+```
+
+Replace `D:\GTA6\...` with the path to **your** `game_scarlett_master.exe`.
+
+<details>
+<summary><b>All switches</b></summary>
+<br>
+
+| Switch | Does |
 |:--|:--|
-| `-SeriesX` | 4K Series X path |
-| `-Ram32` | profile for 32 GB RAM |
-| `-Stats -Tag x` | log + memory curve to files |
-| `-Dred` | names the shader when the GPU hangs |
+| `-Game '<path>'` | your `game_scarlett_master.exe` |
+| `-Warm` | translate all shaders first (first start, and after updates) |
+| `-SeriesX` | 4K Series X path (recommended) |
+| `-Ram32` | smaller buffers for PCs with **32 GB** RAM (leave it out on 64 GB) |
+| `-Stats -Tag x` | writes `statsx.log` and `memwatchx.csv` next to the script, handy for bug reports |
+| `-Dred` | if the GPU hangs, the log names the shader that caused it |
+| `-GpuTime` | logs the 25 most expensive GPU passes every 5 s |
+| `-NoAutoA` | do not tap A through the start screens automatically |
+| `-NoOcean` | turn off the water physics fix (boats sink) |
+| `-Env 'NAME=value;...'` | any extra `VICTORY_*` setting |
+
+Note: it is `-Warm`, one dash. `victory.exe warm` (no dash) does the same without starting the game.
+
+</details>
+
+<details>
+<summary><b>Something went wrong?</b></summary>
+<br>
+
+| Problem | Try |
+|:--|:--|
+| Script won't run | `Set-ExecutionPolicy -Scope Process Bypass`, then start again |
+| "Not found" | the `-Game` path is wrong, put it in single quotes |
+| Crash in `amdxc64.dll` | AMD driver issue, this port is tested on NVIDIA only. Update the driver, or use an AMD-focused fork |
+| Black or missing objects after an update | start once with `-Warm` |
+| Crash or freeze | run with `-Stats -Tag bug` and attach `statsbug.log` and `%LOCALAPPDATA%\victory\data\7952987A\crashes.log` to an issue |
+
+</details>
+
+**Windows 10** also works: run `cargo xtask agility` once (it fetches Microsoft's D3D12 Agility SDK, hash-checked) and keep the `D3D12` folder next to `victory.exe`. Windows 11 needs nothing.
 
 **Controls** · F9 mouse look · WASD move · Enter / Backspace / X / Y as A / B / X / Y · F10 overlay · F12 screenshot
 
@@ -128,7 +202,7 @@ Needs Visual Studio Build Tools (MSVC + Windows SDK) and [rustup](https://rustup
 ## ◆ Credits
 
 **Traffic** &amp; **imgone** for Neptune, the base of this port.
-Built on Marvisak/VIctory · fxceless &amp; myokex (base, levels on demand, heap sync; PRs by Jonirulah, Flyander, AscilCH) · soldsawn (shader translator) · Belobug &amp; ShakiraRED-dt (ambient pass) · ZSlayerHQ · JoshuuDev · skornuta · Trexies · the DexNom FidelityFX patch. Full list in [`docs/NEPTUNE-README.txt`](docs/NEPTUNE-README.txt).
+Built on Marvisak/VIctory · fxceless &amp; myokex (base, levels on demand, heap sync; PRs by Jonirulah, Flyander, AscilCH) · soldsawn (shader translator) · Belobug &amp; ShakiraRED-dt (ambient pass) · ZSlayerHQ · JoshuuDev · skornuta · Trexies · the DexNom FidelityFX patch · domints (Windows 10 Agility SDK loader, fxceless/victory-fork#402). Full list in [`docs/NEPTUNE-README.txt`](docs/NEPTUNE-README.txt).
 Port by **zm0kie**.
 
 <br>

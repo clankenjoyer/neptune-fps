@@ -155,6 +155,18 @@ pub extern "system" fn XMemVirtualAlloc(
     };
     if base.is_null() && !at.is_null() && kind & MEM_RESERVE_PLACEHOLDER == 0 {
         victory_gpu::titlemem::title_range(at as usize, size, victory_gpu::titlemem::VIRTUAL);
+        // Local (VICTORY_TILED): a write-watched reservation, a stretch of the tiled image.
+        victory_gpu::tiled::reserved(at as usize, size);
+    }
+    // Local (VICTORY_TILED views): a placeholder for physical-page views, a stretch of the
+    // tiled image too with `VICTORY_TILED_VIEWS`.
+    if base.is_null() && !at.is_null() && kind & MEM_RESERVE_PLACEHOLDER != 0 {
+        victory_gpu::tiled::view_reserved(at as usize, size);
+    }
+    // Ported from our build (VICTORY_FAULT_TRACK): memory that held something
+    // else before: what the GPU side tracked there by faults is stale.
+    if !at.is_null() && kind & MEM_COMMIT != 0 {
+        victory_gpu::title_memory_allocated(at as usize, size);
     }
     if base.is_null() {
         tracing::debug!(
@@ -391,8 +403,164 @@ struct Physical {
     pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
+    /// With [`pool_commit`]: pages given to the title that no section
+    /// holds yet. They are placed when first mapped or written
+    /// ([`place_pages`]), a mapped range's pages one after the other, so
+    /// that what the title maps as one range is one run of a section and
+    /// the GPU side can open it in place as one buffer.
+    fresh: std::collections::HashSet<usize>,
+    /// The pool's sections, [`POOL_CHUNK`] pages each, made committed as
+    /// the pages before them are placed.
+    pool: Vec<Arc<Section>>,
+    /// The pool's pages placed so far, over all its sections.
+    pool_next: usize,
+    /// Placed slices whose pages the title freed, for single pages.
+    spare: Vec<Slice>,
+    /// Local, with [`pool_by_address`]: sections by the stretch of title
+    /// addresses whose pages they hold (address / [`AREA`]), `None` for one
+    /// that could not be made, and which of their slices are taken.
+    areas: HashMap<usize, Option<(Arc<Section>, Vec<bool>)>>,
+    /// Section handle to its key in `areas`.
+    area_of: HashMap<usize, usize>,
     /// Where each page is shown, by section and index in it.
     shown: HashMap<(usize, usize), Vec<usize>>,
+}
+
+/// Pages of one section of the pool (1 GiB: a host heap opened on a
+/// section must stay well under 4 GiB).
+const POOL_CHUNK: usize = (1 << 30) / PAGE;
+
+/// Whether physical pages come from committed sections of 1 GiB that the
+/// GPU side can open as host heaps, placed when first mapped
+/// (`VICTORY_POOL_COMMIT=1`; off by default: one reserved section per
+/// allocation, its pages fixed when it is made, as before).
+///
+/// What it costs: a section's 1 GiB is charged to the system's commit when
+/// the section is made (its pages are still only taken when touched).
+fn pool_commit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !on_wine() && std::env::var_os("VICTORY_POOL_COMMIT").is_some_and(|v| v == "1"))
+}
+
+/// Gives every page of `pages` that has no place yet ([`Physical::fresh`])
+/// one: runs of such pages go to consecutive slices of the pool. False if
+/// a section could not be made.
+/// Local: bytes of title addresses one section of [`pool_by_address`] holds.
+const AREA: usize = 256 << 20;
+
+/// Local (`VICTORY_POOL_BY_ADDRESS=1`, with [`pool_commit`]): a page not
+/// placed yet takes the slice its first address names, in a section of its
+/// own stretch of addresses, so that pages the title maps one at a time
+/// side by side, in any order, are still one run of one section and the
+/// GPU side can open the range in place as one buffer.
+fn pool_by_address() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| pool_commit() && std::env::var_os("VICTORY_POOL_BY_ADDRESS").is_some_and(|v| v == "1"))
+}
+
+/// [`pool_by_address`]: places the pages of `pages` that have no place yet
+/// by the address each is mapped at, `base` on. What it cannot place (the
+/// slice is taken, or no section could be made) is left to [`place_pages`].
+fn place_by_address(physical: &mut Physical, base: usize, pages: &[usize]) {
+    if physical.fresh.is_empty() {
+        return;
+    }
+    for (i, &page) in pages.iter().enumerate() {
+        if !physical.fresh.contains(&page) {
+            continue;
+        }
+        let at = base + i * PAGE;
+        let (area, index) = (at / AREA, at % AREA / PAGE);
+        let entry = physical.areas.entry(area).or_insert_with(|| {
+            // SAFETY: plain section creation.
+            let handle = unsafe {
+                CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE | SEC_COMMIT, 0, AREA as u32, std::ptr::null())
+            };
+            if handle.is_null() {
+                let error = std::io::Error::last_os_error();
+                tracing::warn!(area, %error, "a section of the page pool by address could not be made: its pages go to the pool in order");
+                return None;
+            }
+            victory_gpu::title_memory_section(handle as usize, AREA as u64, true);
+            Some((Arc::new(Section(handle)), vec![false; AREA / PAGE]))
+        });
+        let Some((section, taken)) = entry else { continue };
+        if taken[index] {
+            continue;
+        }
+        taken[index] = true;
+        let slice = Slice { section: section.clone(), index };
+        let handle = section.0 as usize;
+        physical.area_of.insert(handle, area);
+        physical.fresh.remove(&page);
+        physical.pages.insert(page, slice);
+    }
+}
+
+fn place_pages(physical: &mut Physical, pages: &[usize]) -> bool {
+    if physical.fresh.is_empty() {
+        return true;
+    }
+    let mut i = 0;
+    while i < pages.len() {
+        if !physical.fresh.contains(&pages[i]) {
+            i += 1;
+            continue;
+        }
+        let mut run = 1;
+        while i + run < pages.len() && physical.fresh.contains(&pages[i + run]) {
+            run += 1;
+        }
+        if run == 1
+            && let Some(slice) = physical.spare.pop()
+        {
+            physical.fresh.remove(&pages[i]);
+            physical.pages.insert(pages[i], slice);
+            i += 1;
+            continue;
+        }
+        let mut done = 0;
+        while done < run {
+            let (chunk, index) = (physical.pool_next / POOL_CHUNK, physical.pool_next % POOL_CHUNK);
+            if chunk == physical.pool.len() {
+                let size = (POOL_CHUNK * PAGE) as u64;
+                // SAFETY: plain section creation.
+                let handle = unsafe {
+                    CreateFileMappingW(
+                        INVALID_HANDLE_VALUE,
+                        std::ptr::null(),
+                        PAGE_READWRITE | SEC_COMMIT,
+                        (size >> 32) as u32,
+                        size as u32,
+                        std::ptr::null(),
+                    )
+                };
+                if handle.is_null() {
+                    let error = std::io::Error::last_os_error();
+                    tracing::warn!(chunk, %error, "a committed section of the page pool could not be made");
+                    return false;
+                }
+                victory_gpu::title_memory_section(handle as usize, size, true);
+                physical.pool.push(Arc::new(Section(handle)));
+            }
+            let take = (run - done).min(POOL_CHUNK - index);
+            for k in 0..take {
+                let page = pages[i + done + k];
+                // A page named twice in one call is placed once.
+                if physical.fresh.remove(&page) {
+                    let slice = Slice {
+                        section: physical.pool[chunk].clone(),
+                        index: index + k,
+                    };
+                    physical.pages.insert(page, slice);
+                }
+            }
+            physical.pool_next += take;
+            done += take;
+        }
+        i += run;
+    }
+    true
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -421,6 +589,20 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
         return 0;
     };
+    if pool_commit() {
+        // Numbers now, places when first mapped or written.
+        let mut physical = physical();
+        let first = physical.next_page;
+        physical.next_page += n * FRAMES;
+        for index in 0..n {
+            let number = first + index * FRAMES;
+            physical.fresh.insert(number);
+            // SAFETY: the title passes room for `n` page numbers.
+            unsafe { pages.add(index).write(number) };
+        }
+        tracing::debug!(n, flags = format_args!("{flags:#x}"), "XMemAllocatePhysicalPages (placed when mapped)");
+        return 1;
+    }
     // A pagefile-backed section of `size` bytes, its pages committed when
     // first mapped or written (`commit`): the title asks for 6.1
     // GiB at once, which a busy host often cannot commit (error 1450).
@@ -484,7 +666,18 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     let mut physical = physical();
     for i in 0..n {
         // SAFETY: the title passes `n` page numbers.
-        physical.pages.remove(&unsafe { *pages.add(i) });
+        let page = unsafe { *pages.add(i) };
+        physical.fresh.remove(&page);
+        if let Some(slice) = physical.pages.remove(&page)
+            && pool_commit()
+        {
+            // A slice placed by address is free for that address again.
+            let area = physical.area_of.get(&(slice.section.0 as usize)).copied();
+            match area.and_then(|a| physical.areas.get_mut(&a)).and_then(|a| a.as_mut()) {
+                Some((_, taken)) => taken[slice.index] = false,
+                None => physical.spare.push(slice),
+            }
+        }
     }
     1
 }
@@ -542,7 +735,10 @@ impl Drop for View {
 fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)>> {
     let end = offset.checked_add(len)?;
     let pages = pages.get(offset / PAGE..end.div_ceil(PAGE))?;
-    let physical = physical();
+    let mut physical = physical();
+    if !place_pages(&mut physical, pages) {
+        return None;
+    }
     let mut runs: Vec<(Slice, usize)> = Vec::new();
     for page in pages {
         let slice = physical.pages.get(page)?;
@@ -571,6 +767,8 @@ pub(crate) fn pages_known(pages: &[usize], offset: usize, len: usize) -> bool {
 /// costs a map, a commit and an unmap (which flushes every core's TLB).
 /// False if a page is unknown or the host fails.
 pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> bool {
+    // Ported from our build (VICTORY_LAZY_BACK).
+    overwriting(pages, offset, data.len());
     let Some(runs) = runs(pages, offset, data.len()) else {
         return false;
     };
@@ -637,6 +835,8 @@ impl PageWindow {
 /// unknown, or a host failure), which `write_physical` then handles or
 /// reports.
 pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<PageWindow> {
+    // Ported from our build (VICTORY_LAZY_BACK).
+    overwriting(pages, offset, len);
     let runs = runs(pages, offset, len)?;
     let [(slice, n)] = runs.as_slice() else {
         return None;
@@ -647,6 +847,20 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
         len,
         slice: slice.clone(),
     })
+}
+
+/// Ported from our build (VICTORY_LAZY_BACK). Before a write into physical
+/// pages through a view of our own: what the card wrote earlier at the
+/// title addresses showing those bytes, and the title has not got yet, is
+/// older than what is about to be written and is let go of now
+/// (`victory_gpu::title_memory_overwriting`; nothing without the lazy
+/// copy-back). Told only when the write was done, a touch of the title's in
+/// the middle of a load merged the card's old bytes into the half-loaded
+/// page.
+fn overwriting(pages: &[usize], offset: usize, len: usize) {
+    for (at, bytes) in shown_at(pages, offset, len) {
+        victory_gpu::title_memory_overwriting(at, bytes);
+    }
 }
 
 /// The title addresses that show bytes `[offset, offset + len)` of `pages`
@@ -733,6 +947,16 @@ pub extern "system" fn XMemMapPhysicalPages(
 #[track_caller]
 fn map_pages(physical: &mut Physical, base: usize, n: usize, pages: Option<&[usize]>) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
+    // With the committed pool: pages not placed yet get their place now.
+    if let Some(pages) = pages {
+        let pages = &pages[..n.min(pages.len())];
+        if pool_by_address() {
+            place_by_address(physical, base, pages);
+        }
+        if !place_pages(physical, pages) {
+            return false;
+        }
+    }
     WORK[7].fetch_add(n as u64, Relaxed);
     // (Neptune) The pages are there already, each where it is asked for, or nothing is
     // there and nothing is asked for: on the console that costs the title next to nothing,
@@ -1144,7 +1368,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
 
 /// Commits the section pages a view shows (once per page, whichever view).
 fn commit(base: usize, len: usize) -> bool {
-    if on_wine() {
+    if on_wine() || pool_commit() {
         return true; // sections are committed whole there
     }
     // SAFETY: `[base, base + len)` is a view of a reserved section.

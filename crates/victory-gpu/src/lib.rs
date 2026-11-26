@@ -15,8 +15,12 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+#[cfg(all(test, windows))]
+mod agility;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+mod coalesce;
+mod epoch;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
@@ -24,6 +28,10 @@ pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
 mod ambient;
+#[cfg(windows)]
+mod cores;
+#[cfg(windows)]
+mod placement;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
@@ -39,11 +47,25 @@ mod overlay;
 #[cfg(windows)]
 mod pixels;
 #[cfg(windows)]
+mod prof;
+#[cfg(windows)]
 mod screenshot;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
 mod inplace;
+// Local (VICTORY_INPLACE_ROLE)
+#[cfg(windows)]
+mod inplace_role;
+// Ported from our build (VICTORY_LAZY_BACK).
+#[cfg(windows)]
+mod lazy;
+// Ported from our build (VICTORY_BACK_ON_DEMAND): the per-copy stamp it needs.
+#[cfg(windows)]
+mod stamp;
+// Ported from our build (VICTORY_QUEUE2).
+#[cfg(windows)]
+mod queue2;
 pub mod list;
 pub mod object;
 pub mod pipeline;
@@ -67,6 +89,9 @@ mod shadow;
 mod windowup;
 #[cfg(windows)]
 mod tiles;
+// Local (VICTORY_TILED)
+#[cfg(windows)]
+pub mod tiled;
 pub mod signature;
 #[cfg(windows)]
 mod texback;
@@ -81,6 +106,14 @@ mod watch;
 pub use host::on_failure;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+// Ported from our build (VICTORY_LAZY_BACK): for the runtime's loads through views of its own.
+#[cfg(windows)]
+#[allow(unused_imports)]
+pub use lazy::title_memory_overwriting;
+// Ported from our build (VICTORY_FAULT_TRACK): for the runtime's allocation and free paths.
+#[cfg(windows)]
+#[allow(unused_imports)]
+pub use watch::title_memory_allocated;
 #[cfg(windows)]
 pub use watch::{
     Remapping, notify_view_writes, title_memory_reading, title_memory_reading_range, title_memory_remapped,

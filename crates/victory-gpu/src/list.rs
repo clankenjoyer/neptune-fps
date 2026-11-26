@@ -18,6 +18,9 @@ use crate::object::{
 use crate::queue::Written;
 use crate::resource::PAGEABLE_IIDS;
 
+#[cfg(windows)]
+pub(crate) mod thin;
+
 const ALLOCATOR_IIDS: [Iid; 4] = [
     guid(
         0x6102dee4,
@@ -127,6 +130,10 @@ struct List {
     /// at them before it runs `host`.
     #[cfg(windows)]
     gate: Vec<ValueWait>,
+    /// (Neptune, from avatarmanz/VIctory-7900XTX) With `VICTORY_THIN=1`, of a list the title
+    /// has: what it wrote down ([`thin`]; then there is no `host`).
+    #[cfg(windows)]
+    thin: thin::Front,
 }
 
 /// One part of a title list cut at its waits: the waits the queue stands
@@ -178,7 +185,10 @@ pub(crate) fn is_list(this: This) -> bool {
     }
     // SAFETY: a title object's first word is its table; only read.
     let table = unsafe { (*this).table() };
-    table == LIST_FUNCTIONS.0.as_ptr() || table == NEWER_LIST_FUNCTIONS.0.as_ptr()
+    table == LIST_FUNCTIONS.0.as_ptr()
+        || table == NEWER_LIST_FUNCTIONS.0.as_ptr()
+        || table == THIN_FUNCTIONS.0.as_ptr()
+        || table == NEWER_THIN_FUNCTIONS.0.as_ptr()
 }
 
 /// Runs `f` with the host list behind `this` and the draw state the title
@@ -188,7 +198,20 @@ pub(crate) fn with_host(
     this: This,
     f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State),
 ) -> bool {
-    if !is_list(this) || host_list(this).is_none() {
+    if !is_list(this) {
+        return false;
+    }
+    // (Neptune) A list whose calls are written down has its host list behind a list of ours,
+    // once what was written so far is translated.
+    let this = if thin::on() && host_list(this).is_none() {
+        match thin::caught_up(this) {
+            Some(back) => back,
+            None => return false,
+        }
+    } else {
+        this
+    };
+    if host_list(this).is_none() {
         return false;
     }
     with_state(this, f);
@@ -256,7 +279,15 @@ const IDLE_MOST_USUAL: (usize, u64) = (128, 256 << 20);
 fn idle_most() -> (usize, u64) {
     static MOST: std::sync::OnceLock<(usize, u64)> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        let lists = std::env::var("VICTORY_LIST_POOL_MOST").ok().and_then(|v| v.parse().ok()).unwrap_or(IDLE_MOST_USUAL.0);
+        // Ported from our build (VICTORY_REUSE_IDLE): 512 idle lists when
+        // Neptune's own limit is not given. (The other half of the switch,
+        // a pool of texture staging buffers, Neptune has on by default:
+        // `crate::texture`'s `VICTORY_STAGE_POOL_MB`.)
+        let reuse_idle = std::env::var_os("VICTORY_REUSE_IDLE").is_some_and(|v| v == "1");
+        let lists = std::env::var("VICTORY_LIST_POOL_MOST")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(if reuse_idle { 512 } else { IDLE_MOST_USUAL.0 });
         let bytes = std::env::var("VICTORY_LIST_POOL_MB").ok().and_then(|v| v.parse::<u64>().ok()).map_or(IDLE_MOST_USUAL.1, |mb| mb << 20);
         (lists, bytes)
     })
@@ -518,6 +549,37 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
     parts
 }
 
+/// (Neptune) A list of ours for a frame's first submission to run behind: the once-a-frame
+/// passes over the heap's views, recorded now (`crate::draw::passes_ahead`). `None`: not
+/// asked for, no draw has had a view heap yet, or no host list.
+#[cfg(windows)]
+pub(crate) fn ahead_of_frame() -> Option<Detached> {
+    if !crate::draw::passes_ahead() {
+        return None;
+    }
+    // Local (`VICTORY_AHEAD_SYNC=1`; off by default): the records the title copied into its
+    // heap as bytes are mirrored here, on the thread that records this list, before the pass
+    // looks at the heap's slots. The frame's first submission found them all at once (some
+    // 170,000 slots looked at, 10 to 14 ms of the thread that runs the lines), and the pass
+    // saw the buffer views among them a frame late.
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| std::env::var_os("VICTORY_AHEAD_SYNC").is_some_and(|v| v == "1")) {
+            crate::descriptor::sync_heaps();
+        }
+    }
+    let host = fresh_list()?;
+    let mut state = crate::draw::State::default();
+    let recorded = state.passes_ahead(&host);
+    host.close();
+    if !recorded {
+        // Used again as it is.
+        recycle(vec![Detached { host, _uploads: Vec::new(), _state: state }], &[0]);
+        return None;
+    }
+    Some(Detached { host, _uploads: Vec::new(), _state: state })
+}
+
 /// Takes the host sides of submitted lists (each once, however often the
 /// submission names it) and leaves each list a new, closed host list for
 /// its next reset: what was taken, and which of them run in what order.
@@ -631,11 +693,29 @@ fn new_list(
         return E_INVALIDARG;
     }
     tracing::debug!(kind, "command list");
+    #[cfg(windows)]
+    if thin::on() {
+        let mut list = boxed(kind, pipeline, true);
+        list.thin.begin(kind, pipeline);
+        return object::hand_out(LIST, list, iid, &LIST_IIDS, out);
+    }
+    object::hand_out(LIST, boxed(kind, pipeline, false), iid, &LIST_IIDS, out)
+}
+
+/// A list; with `thin` one whose calls are written down (it has no host list).
+fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
+    #[cfg(not(windows))]
+    let _ = thin;
     let list = Box::new(List {
-        object: if crate::device::newer() {
-            Object::new(&NEWER_LIST_FUNCTIONS)
-        } else {
-            Object::new(&LIST_FUNCTIONS)
+        object: match (crate::device::newer(), thin) {
+            (true, false) => Object::new(&NEWER_LIST_FUNCTIONS),
+            (false, false) => Object::new(&LIST_FUNCTIONS),
+            #[cfg(windows)]
+            (true, true) => Object::new(&NEWER_THIN_FUNCTIONS),
+            #[cfg(windows)]
+            (false, true) => Object::new(&THIN_FUNCTIONS),
+            #[cfg(not(windows))]
+            _ => Object::new(&LIST_FUNCTIONS),
         },
         kind,
         put: [0; 5],
@@ -646,7 +726,7 @@ fn new_list(
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().and_then(|h| match h.new_list() {
+        host: crate::host::host().filter(|_| !thin).and_then(|h| match h.new_list() {
             Ok(list) => Some(list),
             Err(e) => {
                 tracing::warn!(error = %e, "no host command list");
@@ -663,10 +743,12 @@ fn new_list(
         earlier: Vec::new(),
         #[cfg(windows)]
         gate: Vec::new(),
+        #[cfg(windows)]
+        thin: Default::default(),
     });
     #[cfg(not(windows))]
     let _ = pipeline;
-    object::hand_out(LIST, list, iid, &LIST_IIDS, out)
+    list
 }
 
 extern "system" fn allocator_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
@@ -816,6 +898,11 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     if let Some(list) = host_list(this)
         && !barriers.is_null()
     {
+        // (`VICTORY_INDIRECT_BATCH=2`, from cool_fox, GPL-3.0-or-later) The title waits:
+        // a batch that dispatches since may have written ends.
+        if count > 0 && crate::draw::batches() == 2 {
+            with_state(this, |_, state| state.synced());
+        }
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
         let mut host: Vec<Barrier> = barriers
@@ -895,6 +982,10 @@ extern "system" fn copy_buffer_region(
     {
         if !card_copy(list, to, from, len) {
             list.defer_copy(to, from, len as usize);
+        } else if crate::draw::batches() > 0 {
+            // (`VICTORY_INDIRECT_BATCH`, from cool_fox) A copy in the list may write
+            // arguments a batch clamped before it.
+            with_state(this, |_, state| state.copied());
         }
     }
     #[cfg(not(windows))]
@@ -934,10 +1025,19 @@ fn card_copy(list: &crate::host::HostList, to: *mut u8, from: *const u8, len: u6
     let (Some(source), Some(target)) = (crate::shadow::find(from, len), crate::shadow::find(to, len)) else {
         return false;
     };
-    if source.left(from) < len || target.left(to) < len || source.unwatched() || target.unwatched() {
+    // Local (VICTORY_INPLACE_ROLE): memory in place is not watched, but has no
+    // refresh that could copy over what the card copied: it may take part.
+    let unwatched = |s: &crate::shadow::Shadow| s.unwatched() && !(crate::inplace_role::on() && s.in_place());
+    if source.left(from) < len || target.left(to) < len || unwatched(&source) || unwatched(&target) {
         return false;
     }
     if std::sync::Arc::ptr_eq(&source, &target) && from < to + len && to < from + len {
+        return false;
+    }
+    // Local (VICTORY_TILED): two uses of one stretch of the image are one host resource, which
+    // cannot be a copy's source and destination at once: on the CPU, as before.
+    if source.tiled() && target.tiled() && source.buffer == target.buffer {
+        crate::tiled::note_same_resource_copy();
         return false;
     }
     // What the title's CPU side wrote of both first, then the copy, then
@@ -946,6 +1046,7 @@ fn card_copy(list: &crate::host::HostList, to: *mut u8, from: *const u8, len: u6
     target.refresh(list, to, len);
     target.gpu_writes(list, to, len);
     let wait = [crate::indirect::uav_barrier()];
+    list.gpu_stamp("card copy", 0, len);
     // SAFETY: an open list; the list holds both host copies (their
     // refreshes), and the ranges are inside them.
     unsafe {
@@ -1019,6 +1120,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
+            list.gpu_stamp("texture copy resource", 0, 0);
             // SAFETY: an open list and live textures.
             unsafe { list.list.CopyResource(to, from) };
         } else if let (Some((to, a)), Some((from, b))) = (
@@ -1125,7 +1227,8 @@ extern "system" fn copy_texture_region(
             };
             // The list owns this mapped D3D12 upload buffer. Wine can report
             // its address as MEM_FREE, so use the host-upload path.
-            list.defer_fill(staging, data, bytes as usize);
+            // From cool_fox (VICTORY_CARD_STEPS=2): the card may fill it instead.
+            list.defer_fill_buffer(&buffer, staging, data, bytes as usize);
             from.resource = buffer.as_raw().cast_const().cast();
             from.footprint.offset = 0;
             {
@@ -1193,6 +1296,7 @@ extern "system" fn copy_texture_region(
         }
         const _: () =
             assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
+        list.gpu_stamp("texture copy region", 0, 0);
         // SAFETY: an open list; both locations in the host's layout, naming
         // live resources; the box is the title's (same layout).
         unsafe {
@@ -1262,6 +1366,7 @@ fn read_back(
             src.resource, src.footprint.offset as u32, dst.resource, dst.footprint.offset
         )
     });
+    list.gpu_stamp("texture readback", 0, 0);
     // SAFETY: an open list; both locations in the host's layout (asserted
     // in `copy_texture_region`), naming a live texture and our buffer, which
     // the list keeps until it is reset; the box is the title's.
@@ -1322,6 +1427,7 @@ extern "system" fn resolve(
         ensure_state(list, src, RESOLVE_SOURCE);
         crate::texture::host_written(dst);
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
+        list.gpu_stamp("resolve", 0, 0);
         // SAFETY: an open list and live textures; the region is inside both.
         unsafe {
             let (a, b) = (to.GetDesc(), from.GetDesc());
@@ -1566,7 +1672,16 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 /// bottom of the pipe `(flags, control, address, size)`. Host lists order
 /// their own work and every submission is waited for, so there is nothing
 /// to do.
-extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
+/// (`VICTORY_INDIRECT_BATCH=2`, from cool_fox, GPL-3.0-or-later) Except that the title
+/// waits here for its dispatches: a batch they may have written ends (`State::synced`).
+extern "system" fn sync(this: This, _flags: u32, _control: u32, _address: u64, _size: u64) {
+    #[cfg(windows)]
+    if crate::draw::batches() == 2 {
+        with_state(this, |_, state| state.synced());
+    }
+    #[cfg(not(windows))]
+    let _ = this;
+}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.
@@ -2113,6 +2228,23 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         && let Some(list) = host_list(this)
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+        // (`VICTORY_INDIRECT_BATCH=2`, from cool_fox, GPL-3.0-or-later) The title waits:
+        // a batch that dispatches since may have written ends (before a merge skips it).
+        if crate::draw::batches() == 2 {
+            with_state(this, |_, state| state.synced());
+        }
+        // Ported from our build (VICTORY_BARRIER_MERGE): nothing stored
+        // through unordered access since the list's last such wait: nothing
+        // to wait for.
+        if crate::host::barrier_merge() {
+            use std::sync::atomic::Ordering::Relaxed;
+            if !list.uav_pending() {
+                crate::host::BARRIER_STATS[1].fetch_add(1, Relaxed);
+                return;
+            }
+            list.set_uav_pending(false);
+            crate::host::BARRIER_STATS[0].fetch_add(1, Relaxed);
+        }
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
@@ -2332,6 +2464,11 @@ const fn list_table(newer: bool) -> [*const (); 160] {
 /// titles add.
 static LIST_FUNCTIONS: Table<160> = Table(list_table(false));
 static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
+/// (Neptune, from avatarmanz/VIctory-7900XTX) Of lists whose calls are written down.
+#[cfg(windows)]
+static THIN_FUNCTIONS: Table<160> = Table(thin::table(false));
+#[cfg(windows)]
+static NEWER_THIN_FUNCTIONS: Table<160> = Table(thin::table(true));
 
 #[cfg(test)]
 mod tests {

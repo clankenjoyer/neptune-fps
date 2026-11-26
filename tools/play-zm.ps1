@@ -26,6 +26,7 @@ param(
   [string]$Game = 'D:\ProjectAmerica\game_scarlett_master.exe',   # your own copy's game_scarlett_master.exe
   [switch]$Warm,                                  # translate the shaders into the cache first
   [switch]$NoAutoA,                               # do not tap A through the start screens
+  [switch]$SeriesSRaw,                            # local: Series S mode without a PC FidelityFX DLL (the title's own upscaler DLL is mapped)
   [switch]$SeriesX,                               # the 4K path, the title's upscaler not used
   [string]$FsrDll = '',                           # a PC amd_fidelityfx_upscaler_dx12.dll
   [string]$OptiScaler = '',                       # the folder of an extracted OptiScaler release
@@ -36,9 +37,19 @@ param(
   [switch]$Ram32,                                  # zm0kie: 32 GB PC profile (smaller pools)
   [string]$Env = '',                               # zm0kie: extra variables 'NAME=value;NAME2=value'
   [switch]$Dred,                                   # zm0kie: device-removed report (DRED breadcrumbs, page fault, per-command pipeline hashes)
-  [switch]$RawIndirect                             # zm0kie: VICTORY_INDIRECT_RAW=2 as upstream (hung the GPU on our PC); default 3: checked on the CPU first
+  [string]$InPlace = 'auto',                       # game memory shared with the card with no copies: on, off, or auto (only on a fast PCIe link; else data stays on the card)
+  [switch]$StockCopies,                            # Neptune's own copy-back as it was (default: our lazy copy-back and fault tracking, measured faster)
+  [switch]$NoClampAfterWriter,                     # zm0kie: no sanitize-after-writer for indirect args (readers clamped as before)
+  [switch]$NoClampBatch,                           # zm0kie: indirect records clamped one by one, as before
+  [switch]$NoThin,                                 # upstream: draw calls translated on the game's own threads, as before
+  [switch]$NoOcean,                                # zm0kie: no ocean read-back (boats sink, no swimming)
+  [switch]$RawIndirect,                            # zm0kie: VICTORY_INDIRECT_RAW=2 as upstream (hung the GPU on our PC); default 3: checked on the CPU first
+  [switch]$GpuTime                                 # zm0kie: VICTORY_GPU_TIME=1, GPU ms per command in the log every 5 s ("gpu time top")
 )
 if (-not (Test-Path -LiteralPath $Game)) { "Not found: $Game"; exit 1 }
+# zm0kie: start clean. VICTORY_* variables left in this PowerShell window by other launchers
+# (e.g. VICTORY_BVH_BUILDER=1 from a ray-tracing test) would otherwise carry into this run.
+Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | Remove-Item
 $set = [ordered]@{
   # settled
   VICTORY_CARD_WINDOWS_MB     = '4096'      # draw data on the card (16 GB card)
@@ -68,6 +79,10 @@ $set = [ordered]@{
   VICTORY_LIST_POOL_MB        = '2048'
   VICTORY_WIDE_THREADS        = '12'
   VICTORY_UNDER_WRITES_MASKS_LEAST = '1'   # small changes go up in one pass per buffer
+  VICTORY_CLAMP_AFTER_WRITER  = $(if ($NoClampAfterWriter) { '0' } else { '1' })  # zm0kie: indirect args sanitized once after their GPU writers, readers run raw (4.6 -> 8.4 fps)
+  VICTORY_CLAMP_BATCH         = $(if ($NoClampBatch) { '0' } else { '1' })  # zm0kie: in-place indirect clamps batched into windows (one dispatch per run)
+  VICTORY_THIN                = $(if ($NoThin) { '0' } else { '1' })  # (upstream ab7c9cf) the game's draw calls translated by more threads of ours
+  VICTORY_WATCH_4K            = '1'         # (upstream evening build) 4 KiB write tracking
   VICTORY_INDIRECT_RAW        = $(if ($RawIndirect) { '2' } else { '3' })  # indirect draws use the game's own arguments
   VICTORY_TEXTURE_HASH_EVERY  = '32'
   # added 2026-11-25 noon
@@ -140,14 +155,49 @@ if (-not $SeriesX) {
   if ($FsrDll -and (Test-Path $FsrDll)) {
     $set['VICTORY_FSR_DLL'] = (Resolve-Path $FsrDll).Path   # the game's upscaler calls go to this DLL
     $console = @('--console', 'series-s')
+  } elseif ($SeriesSRaw) {
+    $console = @('--console', 'series-s')
   } else {
     'No PC FidelityFX DLL (-OptiScaler <folder>, -FsrDll <path>, or one beside this script): starting the Series X path at 4K.'
   }
 }
 $set['VICTORY_DISCORD'] = '0'
+# zm0kie: the ocean's height and displacement maps go back into title memory, so the game's
+# physics sees the water: boats float, you can swim (texback.rs, linear tile mode only).
+if (-not $NoOcean) { $set['VICTORY_OCEAN_READBACK'] = '1' }
 if ($Ram32) { $set['VICTORY_LIST_POOL_MB'] = '512'; $set['VICTORY_LIST_POOL_MOST'] = '1024'; $set['VICTORY_TEXTURE_STAGE_MB'] = '256'; $set['VICTORY_CARD_WINDOWS_MB'] = '3072' }
+# Copy path measured fastest on a 4-core PC with an RTX A4500 (2026-11-26): our lazy copy-back, on demand, with fault
+# tracking of written pages, in place of Neptune's fetch queue and quiet-back; Neptune's copy-in stays as it is.
+# 170-220 ms a frame became 132-178, copies up 32-39 ms became 15-23, the copy-back thread 20-32 ms became 8-12.
+if (-not $StockCopies) {
+  foreach ($kv in 'VICTORY_GPU_BACK_MAX_KB=1024','VICTORY_RELAY_OWN_QUEUE=0','VICTORY_QUIET_BACK=0','VICTORY_FAULT_TRACK=1','VICTORY_LAZY_BACK=1','VICTORY_BACK_ON_DEMAND=1','VICTORY_REFRESH_STAMP=1','VICTORY_QUEUE2=1','VICTORY_ASK_QUIET_FAULT=1','VICTORY_VIEW_KNOWN=1','VICTORY_FILL_NO_WAIT=1','VICTORY_MERGE_RUNS=65536','VICTORY_REUSE_IDLE=1','VICTORY_CARD_WINDOW_UPLOAD=0','VICTORY_TILED=1') {
+    $p = $kv.Split('=', 2); $set[$p[0]] = $p[1]
+  }
+}
+# In-place memory: the card reads the game's own memory, so nothing is copied up or back. It pays only
+# where the link to the card is fast; on a slow link the card reads slower than the copies cost, and the
+# data is kept on the card instead (the switches above). auto asks Windows for the link.
+$link = $null
+if ($InPlace -eq 'auto') {
+  try {
+    # The fastest link among the display cards (a virtual display adapter reports none).
+    # GB/s, roughly: gen1 0.25, gen2 0.5, gen3 1, gen4 2, gen5 4 per lane.
+    foreach ($card in (Get-PnpDevice -Class Display -PresentOnly -ErrorAction Stop | Where-Object { $_.InstanceId -like 'PCI*' })) {
+      $speed = (Get-PnpDeviceProperty -InstanceId $card.InstanceId -KeyName DEVPKEY_PciDevice_CurrentLinkSpeed -ErrorAction SilentlyContinue).Data
+      $width = (Get-PnpDeviceProperty -InstanceId $card.InstanceId -KeyName DEVPKEY_PciDevice_CurrentLinkWidth -ErrorAction SilentlyContinue).Data
+      if ($speed -and $width) {
+        $one = [math]::Round(@(0, 0.25, 0.5, 1, 2, 4)[[math]::Min([int]$speed, 5)] * [int]$width, 1)
+        if ($null -eq $link -or $one -gt $link) { $link = $one }
+      }
+    }
+  } catch { $link = $null }
+  $InPlace = if ($link -ge 16) { 'on' } else { 'off' }
+  "PCIe link to the card: $(if ($null -eq $link) { 'unknown' } else { "about $link GB/s" }); in-place memory $InPlace (-InPlace on/off overrides)"
+}
+if ($InPlace -eq 'on') { $set['VICTORY_INPLACE'] = '1'; $set['VICTORY_POOL_COMMIT'] = '1' }
 foreach ($pair in ($Env -split ';')) { if ($pair -match '^\s*([A-Z0-9_]+)\s*=\s*(.*)$') { $set[$Matches[1]] = $Matches[2] } }
 if ($Dred) { $set['VICTORY_D3D12_DRED'] = '1' }
+if ($GpuTime) { $set['VICTORY_GPU_TIME'] = '1' }
 foreach ($k in $set.Keys) { Set-Item -Path ("Env:" + $k) -Value $set[$k] }
 # The game's folder, for the shader translation (no config file needed).
 $env:VICTORY_GAME_DIR = Split-Path -Parent (Resolve-Path -LiteralPath $Game)

@@ -133,8 +133,43 @@ pub(crate) enum C {
     /// `watch::writes` askings not made because the range's first block is
     /// already known to be guarded view memory (no kernel call).
     WatchKnownView,
+    // Ported from our build (VICTORY_FAULT_TRACK, VICTORY_BACK_ON_DEMAND).
+    /// Fault tracking (`crate::watch::fault`): writes taken by faults and
+    /// the microseconds of the handler; blocks made read-only (adopted or
+    /// guarded again) and made writable (faults, kernel writes); takes
+    /// (bitmap askings) and their microseconds; blocks adopted; blocks
+    /// turned volatile; blocks found written behind our back by the check,
+    /// and the check's microseconds.
+    FaultFaults,
+    FaultUs,
+    FaultProtected,
+    FaultUnprotected,
+    FaultTakes,
+    FaultTakeUs,
+    FaultAdopted,
+    FaultVolatile,
+    FaultStale,
+    FaultVerifyUs,
+    /// Copy-back on demand (`VICTORY_BACK_ON_DEMAND=1`): ranges declared
+    /// without a snapshot and their bytes; blocks copied at the title's
+    /// first write while flying, and those the pool had no room for;
+    /// blocks merged on demand, bytes written to title memory, and the
+    /// microseconds of those merges.
+    BackDemandRanges,
+    BackDemandBytes,
+    BackCows,
+    BackCowsLost,
+    BackDemandBlocks,
+    BackDemandWritten,
+    BackDemandUs,
+    // Ported from our build (VICTORY_REFRESH_STAMP).
+    /// Refresh requests skipped as checked already in their submission
+    /// (`crate::stamp`), and their bytes.
+    StampSkips,
+    StampSkipBytes,
 }
-const COUNTERS: usize = 80;
+// (Was 80 before the port; the counters above need more.)
+const COUNTERS: usize = if (C::StampSkipBytes as usize + 1) > 80 { C::StampSkipBytes as usize + 1 } else { 80 };
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1118,6 +1153,59 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
     );
+    // Ported from our build (VICTORY_REFRESH_STAMP).
+    if crate::stamp::on() {
+        tracing::info!(
+            "refresh stamp per frame (VICTORY_REFRESH_STAMP=1): {:.0} requests skipped, {:.1} MB, as checked already in their submission",
+            c[C::StampSkips as usize],
+            mb(c[C::StampSkipBytes as usize]),
+        );
+    }
+    // Ported from our build (VICTORY_BACK_ON_DEMAND, VICTORY_FAULT_TRACK).
+    if crate::shadow::on_demand() {
+        tracing::info!(
+            "copy-back on demand per frame (VICTORY_BACK_ON_DEMAND=1): {:.0} ranges {:.1} MB declared without a snapshot; \
+             {:.1} blocks copied at the title's first write while flying ({:.1} found no room); \
+             {:.0} blocks merged on demand, {:.1} MB written to title memory, {:.2} ms",
+            c[C::BackDemandRanges as usize],
+            mb(c[C::BackDemandBytes as usize]),
+            c[C::BackCows as usize],
+            c[C::BackCowsLost as usize],
+            c[C::BackDemandBlocks as usize],
+            mb(c[C::BackDemandWritten as usize]),
+            ms(c[C::BackDemandUs as usize]),
+        );
+    }
+    if crate::watch::fault::on() {
+        tracing::info!(
+            "fault tracking per frame (VICTORY_FAULT_TRACK=1): {:.0} faults {:.2} ms; {:.0} blocks made read-only ({:.0} adopted), \
+             {:.0} made writable; {:.0} takes {:.2} ms; {:.1} blocks turned volatile; {:.1} found written behind our back, check {:.2} ms; \
+             {} blocks ({} MB) tracked now",
+            c[C::FaultFaults as usize],
+            ms(c[C::FaultUs as usize]),
+            c[C::FaultProtected as usize],
+            c[C::FaultAdopted as usize],
+            c[C::FaultUnprotected as usize],
+            c[C::FaultTakes as usize],
+            ms(c[C::FaultTakeUs as usize]),
+            c[C::FaultVolatile as usize],
+            c[C::FaultStale as usize],
+            ms(c[C::FaultVerifyUs as usize]),
+            crate::watch::fault::tracked(),
+            (crate::watch::fault::tracked() * crate::watch::fault::BLOCK as u64) >> 20,
+        );
+        {
+            let v: Vec<f64> = crate::watch::fault::FAULT_SPLIT.iter().map(|x| x.swap(0, Relaxed) as f64).collect();
+            let n = v[3].max(1.0);
+            tracing::info!(
+                "fault split, microseconds per fault that opened a block: {:.1} waiting for the lazy lock, {:.1} keeping a flying block's bytes ({:.0}% of faults), {:.1} changing the protection",
+                v[0] / n / 1e3,
+                v[1] / n / 1e3,
+                v[4] / n * 100.0,
+                v[2] / n / 1e3
+            );
+        }
+    }
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \
          threads); {:.1} ms waiting for pipelines; dynamic slots: {:.0} tables asked, {:.0} \
