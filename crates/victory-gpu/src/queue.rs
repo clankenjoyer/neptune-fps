@@ -1651,7 +1651,10 @@ mod tests {
 #[cfg(windows)]
 fn idle_why() -> usize {
     let mut why = 0;
-    for q in lock(&WAITING).clone() {
+    // (Taken and let go before a line is looked at: the lines' own passes take a line's
+    // lock first and this one after.)
+    let queues = lock(&WAITING).clone();
+    for q in queues {
         // SAFETY: a live queue: one released is taken off the list.
         let held = lock(unsafe { &(*(q as *const Queue)).held });
         let this = match held.first() {
